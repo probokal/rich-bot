@@ -21,8 +21,17 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
 
-from config import ALLOWED_USER_IDS, BOT_TOKEN
+from config import (
+    ALLOWED_USER_IDS,
+    BOT_TOKEN,
+    PORT,
+    WEBHOOK_BASE_URL,
+    WEBHOOK_PATH,
+    WEBHOOK_SECRET,
+)
 from db import (
     init_db,
     list_templates,
@@ -341,6 +350,33 @@ async def cmd_start(message: types.Message, state: FSMContext) -> None:
 @dp.message(Command("help"))
 async def cmd_help(message: types.Message) -> None:
     await message.answer(S.HELP_TEXT)
+
+
+@dp.message(Command("chatid"))
+async def cmd_chatid(message: types.Message) -> None:
+    """Показать ID текущей лички, группы или супергруппы."""
+    await message.answer(
+        f"Тип чата: <code>{message.chat.type}</code>\n"
+        f"chat_id: <code>{message.chat.id}</code>"
+    )
+
+
+@dp.channel_post(Command("chatid"))
+async def channel_chatid(message: types.Message) -> None:
+    """Команда в канале: отправить ID владельцам бота в личку."""
+    delivered = False
+    for user_id in ALLOWED_USER_IDS:
+        try:
+            await bot.send_message(
+                user_id,
+                f"📢 Канал: <b>{html_mod.escape(message.chat.title or 'Без названия')}</b>\n"
+                f"chat_id: <code>{message.chat.id}</code>",
+            )
+            delivered = True
+        except Exception:
+            pass
+    if not delivered:
+        await message.answer(f"chat_id: <code>{message.chat.id}</code>")
 
 
 @dp.message(Command("cancel"))
@@ -701,16 +737,53 @@ async def got_tpl_name(message: types.Message, state: FSMContext) -> None:
 
 
 # ─────────────── Запуск ───────────────
-async def main() -> None:
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN не найден. Проверь .env или Variables в Railway.")
+async def run_polling() -> None:
+    """Локальный режим: одна копия получает обновления через getUpdates."""
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
+    print("Локальный режим polling. Остановить: Ctrl+C")
     try:
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
 
 
+async def webhook_startup(bot: Bot) -> None:
+    """Инициализация Railway и регистрация HTTPS webhook в Telegram."""
+    await init_db()
+    webhook_url = f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
+    await bot.set_webhook(
+        webhook_url,
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True,
+        allowed_updates=dp.resolve_used_update_types(),
+    )
+    print(f"Railway webhook включен: {webhook_url}")
+
+
+def run_webhook() -> None:
+    """Серверный режим: Telegram сам отправляет обновления на Railway."""
+    dp.startup.register(webhook_startup)
+
+    app = web.Application()
+
+    async def healthcheck(_request: web.Request) -> web.Response:
+        return web.Response(text="RichPost Bot is running")
+
+    app.router.add_get("/", healthcheck)
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        secret_token=WEBHOOK_SECRET,
+    ).register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot=bot)
+
+    print(f"Запуск webhook-сервера на 0.0.0.0:{PORT}")
+    web.run_app(app, host="0.0.0.0", port=PORT)
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    if WEBHOOK_BASE_URL:
+        run_webhook()
+    else:
+        asyncio.run(run_polling())
