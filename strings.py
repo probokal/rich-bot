@@ -113,9 +113,9 @@ PROMPTS = {
     "raw": "📟 Приши готовый Rich Markdown или HTML как есть - добавлю без изменений.",
 }
 
-MEDIA_RECEIVED = "✅ Файл получен, загружаю…"
-MEDIA_UPLOADED = "✅ Файл загружен, добавлен в пост. Ссылка: {url}"
-MEDIA_ERROR = "⚠️ Не удалось загрузить файл: {error}"
+MEDIA_RECEIVED = "⏳ Файл получен. Загружаю на медиахостинг…"
+MEDIA_UPLOADED = "✅ Файл добавлен в пост. Публичная ссылка: {url}"
+MEDIA_ERROR = "⚠️ Файл не добавлен: {error}"
 
 BLOCK_ADDED = "✅ Блок добавлен. Всего блоков: {count}"
 BLOCK_ADDED_INSTANT = "✅ Блок добавлен: {kind}"
