@@ -1,12 +1,212 @@
 """
-main.py - полный чат-конструктор Rich-постов на aiogram 3.
-
-Пользователь выбирает тип блока кнопкой, присылает данные, а бот собирает
-официальный Rich Markdown. Медиа в Rich-сообщениях задаются публичными
-HTTP/HTTPS-ссылками: Telegram определяет тип по MIME и URL.
+main.py — точка входа. Регистрируем бота aiogram 3, меню-конструктор
+и обработчики. Запуск: python main.py
 """
 import asyncio
-import html
+import time
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+from config import BOT_TOKEN, ALLOWED_USER_IDS
+from db import init_db, save_draft, load_draft, save_template, list_templates, load_template, log_sent
+from rich_sender import send_rich_message
+from inline_parser import parse_inline
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+
+# ── Простая авторизация: бот отвечает только разрешённым user_id ──
+def allowed(user_id: int) -> bool:
+    return (not ALLOWED_USER_IDS) or (user_id in ALLOWED_USER_IDS)
+
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    if not allowed(message.from_user.id):
+        return  # молча игнорируем чужих
+    await message.answer(
+        "👋 Привет! Я конструктор Rich-постов.\n"
+        "Жми «➕ Добавить блок» и собирай пост по частям.",
+        reply_markup=main_menu(),
+    )
+
+
+# ── Состояния конструктора ──
+class Builder(StatesGroup):
+    waiting_text = State()      # ждём текст для абзаца/заголовка
+    waiting_list = State()      # ждём пункты списка
+    waiting_send = State()      # ждём chat_id для отправки
+
+
+# Хранилище черновика в памяти пользователя (в FSM data).
+def main_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить блок", callback_data="add")],
+        [
+            InlineKeyboardButton(text="👁 Предпросмотр", callback_data="preview"),
+            InlineKeyboardButton(text="📤 Отправить", callback_data="send"),
+        ],
+        [
+            InlineKeyboardButton(text="💾 Сохранить", callback_data="save"),
+            InlineKeyboardButton(text="📂 Шаблоны", callback_data="templates"),
+        ],
+        [InlineKeyboardButton(text="🗑 Сбросить", callback_data="reset")],
+    ])
+
+
+def add_menu():
+    kb = [
+        [InlineKeyboardButton(text="Заголовок", callback_data="add:heading")],
+        [InlineKeyboardButton(text="Абзац", callback_data="add:paragraph")],
+        [InlineKeyboardButton(text="Список", callback_data="add:list")],
+        [InlineKeyboardButton(text="Цитата", callback_data="add:quote")],
+        [InlineKeyboardButton(text="Таблица", callback_data="add:table")],
+        [InlineKeyboardButton(text="⬅ Назад", callback_data="back")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+# ── Главное меню ──
+@dp.callback_query(F.data == "back")
+async def back(cb: types.CallbackQuery):
+    await cb.message.edit_text("Конструктор:", reply_markup=main_menu())
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "add")
+async def add(cb: types.CallbackQuery):
+    await cb.message.edit_text("Какой блок добавить?", reply_markup=add_menu())
+    await cb.answer()
+
+
+# ── Добавление текстовых блоков ──
+@dp.callback_query(F.data.in_(["add:heading", "add:paragraph"]))
+async def add_text(cb: types.CallbackQuery, state: FSMContext):
+    kind = "heading" if cb.data == "add:heading" else "paragraph"
+    await state.update_data(pending=kind)
+    await state.set_state(Builder.waiting_text)
+    await cb.message.answer("Отправьте текст. Можно форматировать: *жирный* _курсив_ `код` ~~зачёрк~~ ==выд== ||спойлер||")
+    await cb.answer()
+
+
+@dp.message(Builder.waiting_text)
+async def got_text(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    kind = data["pending"]
+    segs = parse_inline(message.text)
+    # Превращаем сегменты в markdown-строку блока
+    md = "# " + message.text if kind == "heading" else message.text
+    blocks = (await state.get_data()).get("blocks", [])
+    blocks.append(md)
+    await state.update_data(blocks=blocks)
+    # Убираем только текущее состояние, но сохраняем собранные блоки в FSM data.
+    await state.set_state(None)
+    await message.answer("✅ Добавлено! Продолжаем:", reply_markup=main_menu())
+
+
+# ── Предпросмотр: реально шлём пост самому себе ──
+@dp.callback_query(F.data == "preview")
+async def preview(cb: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    blocks = data.get("blocks", [])
+    if not blocks:
+        await cb.answer("Пост пуст 🤷", show_alert=True)
+        return
+    markdown = "\n\n".join(blocks)
+    await send_rich_message(cb.from_user.id, markdown=markdown)
+    await cb.answer("Отправил превью вам в чат!")
+
+
+# ── Отправка в канал/группу/личку ──
+@dp.callback_query(F.data == "send")
+async def send_menu(cb: types.CallbackQuery, state: FSMContext):
+    await state.set_state(Builder.waiting_send)
+    await cb.message.answer(
+        "Куда отправить? Пришлите chat_id (число), @username канала "
+        "или ссылку-сокращение. Для лички по ID — просто число user_id."
+    )
+    await cb.answer()
+
+
+@dp.message(Builder.waiting_send)
+async def do_send(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    blocks = data.get("blocks", [])
+    markdown = "\n\n".join(blocks)
+    raw_chat_id = message.text.strip()
+    # Числовой ID лички/группы передаём как int, а @username канала оставляем строкой.
+    chat_id = int(raw_chat_id) if raw_chat_id.lstrip("-").isdigit() else raw_chat_id
+    # protect_content и disable_notification можно сделать кнопками;
+    # здесь — пример с защитой контента:
+    result = await send_rich_message(
+        chat_id, markdown=markdown, protect_content=False, disable_notification=False
+    )
+    if result.get("ok"):
+        msg = result["result"]
+        await log_sent(chat_id, msg["message_id"], "post")
+        await message.answer(f"✅ Отправлено! message_id = {msg['message_id']}")
+    else:
+        await message.answer(f"❌ Ошибка: {result}")
+    await state.clear()
+
+
+# ── Сохранение черновика в SQLite ──
+@dp.callback_query(F.data == "save")
+async def save(cb: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    blocks = data.get("blocks", [])
+    if not blocks:
+        await cb.answer("Нечего сохранять", show_alert=True)
+        return
+    markdown = "\n\n".join(blocks)
+    await save_draft(cb.from_user.id, markdown, "")
+    await cb.answer("💾 Черновик сохранён в БД")
+
+
+# ── Шаблоны ──
+@dp.callback_query(F.data == "templates")
+async def templates(cb: types.CallbackQuery):
+    names = await list_templates()
+    text = "Шаблоны:\n" + ("\n".join(f"• {n}" for n in names) if names else "(пусто)")
+    await cb.message.edit_text(text, reply_markup=main_menu())
+    await cb.answer()
+
+
+# ── Сброс ──
+@dp.callback_query(F.data == "reset")
+async def reset(cb: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await cb.message.edit_text("🗑 Конструктор очищен.", reply_markup=main_menu())
+    await cb.answer()
+
+
+# ── Запуск ──
+async def main():
+    await init_db()
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+"""
+main.py - полный чат-конструктор Rich-постов.
+
+- aiogram 3 для кнопок, команд и FSM;
+- sendRichMessage вызывается напрямую через httpx (см. rich_sender.py);
+- при приёме файлов бот автоматически льёт их на публичный файлохостинг и
+  подставляет HTTPS-ссылку в post (загружать файл не обязательно, можно сразу
+  прислать URL);
+- все тексты вынесены в strings.py; там их удобно править.
+"""
+from __future__ import annotations
+
+import asyncio
+import html as html_mod
 import re
 from typing import Any, Awaitable, Callable
 
@@ -28,6 +228,8 @@ from db import (
     save_template,
 )
 from rich_sender import TelegramAPIError, edit_rich_message, send_rich_message
+from uploader import upload_user_media
+import strings as S
 
 
 bot = Bot(token=BOT_TOKEN)
@@ -35,16 +237,14 @@ dp = Dispatcher(storage=MemoryStorage())
 
 
 class Builder(StatesGroup):
-    """Состояния диалога конструктора."""
-
     waiting_block = State()
     waiting_destination = State()
     waiting_template_name = State()
+    waiting_gallery = State()  # сбор коллажа/слайдшоу по файлам
 
 
+# ─────────────── Авторизация ───────────────
 class AuthMiddleware(BaseMiddleware):
-    """Не пропускает пользователей, которых нет в ALLOWED_USER_IDS."""
-
     async def __call__(
         self,
         handler: Callable[[Any, dict[str, Any]], Awaitable[Any]],
@@ -54,9 +254,9 @@ class AuthMiddleware(BaseMiddleware):
         user = data.get("event_from_user")
         if user and ALLOWED_USER_IDS and user.id not in ALLOWED_USER_IDS:
             if isinstance(event, types.CallbackQuery):
-                await event.answer("Доступ запрещен", show_alert=True)
+                await event.answer("Доступ запрещён", show_alert=True)
             elif isinstance(event, types.Message):
-                await event.answer("Доступ к этому боту запрещен.")
+                await event.answer("Доступ к этому боту запрещён.")
             return None
         return await handler(event, data)
 
@@ -65,147 +265,85 @@ dp.message.middleware(AuthMiddleware())
 dp.callback_query.middleware(AuthMiddleware())
 
 
-def button(text: str, data: str) -> InlineKeyboardButton:
+# ─────────────── Клавиатуры ───────────────
+def kb(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def btn(text: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=data)
 
 
-def main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [button("Добавить блок", "menu:add")],
-            [button("Предпросмотр", "preview"), button("Отправить", "menu:send")],
-            [button("Сохранить черновик", "draft:save"), button("Загрузить", "draft:load")],
-            [button("Шаблоны", "menu:templates"), button("Отменить последний", "undo")],
-            [button("Очистить", "reset"), button("Помощь", "help")],
-        ]
-    )
+def main_menu(data: dict[str, Any]) -> InlineKeyboardMarkup:
+    return kb([
+        [btn(S.BTN_ADD, "menu:add")],
+        [btn(S.BTN_PREVIEW, "preview"), btn(S.BTN_SEND, "menu:send")],
+        [btn(S.BTN_SAVE_DRAFT, "draft:save"), btn(S.BTN_LOAD_DRAFT, "draft:load")],
+        [btn(S.BTN_TEMPLATES, "menu:templates"), btn(S.BTN_UNDO, "undo")],
+        [btn(S.BTN_RESET, "reset"), btn(S.BTN_HELP, "help")],
+    ])
 
 
-def add_text_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [button("Заголовок H1-H6", "build:heading"), button("Абзац", "build:paragraph")],
-            [button("Разделитель", "instant:divider"), button("Подвал", "build:footer")],
-            [button("Маркированный список", "build:list_ul")],
-            [button("Нумерованный список", "build:list_ol")],
-            [button("Список с флажками", "build:list_check")],
-            [button("Цитата", "build:blockquote"), button("Pull-цитата", "build:pullquote")],
-            [button("Код-блок", "build:code"), button("Details", "build:details")],
-            [button("Медиа", "menu:media"), button("Дополнительно", "menu:advanced")],
-            [button("Назад", "back")],
-        ]
-    )
+def text_menu() -> InlineKeyboardMarkup:
+    return kb([
+        [btn(S.BTN_HEADING, "build:heading"), btn(S.BTN_PARAGRAPH, "build:paragraph")],
+        [btn(S.BTN_DIVIDER, "instant:divider"), btn(S.BTN_FOOTER, "build:footer")],
+        [btn(S.BTN_LIST_UL, "build:list_ul")],
+        [btn(S.BTN_LIST_OL, "build:list_ol")],
+        [btn(S.BTN_LIST_CHECK, "build:list_check")],
+        [btn(S.BTN_QUOTE, "build:blockquote"), btn(S.BTN_PULLQUOTE, "build:pullquote")],
+        [btn(S.BTN_CODE, "build:code"), btn(S.BTN_DETAILS, "build:details")],
+        [btn(S.BTN_TO_MEDIA, "menu:media"), btn(S.BTN_TO_ADVANCED, "menu:advanced")],
+        [btn(S.BTN_BACK, "back")],
+    ])
 
 
 def media_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [button("Фото", "build:photo"), button("Видео", "build:video")],
-            [button("Музыка / аудио", "build:audio"), button("GIF", "build:animation")],
-            [button("Голосовая заметка", "build:voice")],
-            [button("Коллаж", "build:collage"), button("Слайдшоу", "build:slideshow")],
-            [button("Назад к блокам", "menu:add"), button("Главное меню", "back")],
-        ]
-    )
+    return kb([
+        [btn(S.BTN_PHOTO, "build:photo"), btn(S.BTN_VIDEO, "build:video")],
+        [btn(S.BTN_AUDIO, "build:audio"), btn(S.BTN_ANIM, "build:animation")],
+        [btn(S.BTN_VOICE, "build:voice")],
+        [btn(S.BTN_COLLAGE, "build:collage"), btn(S.BTN_SLIDESHOW, "build:slideshow")],
+        [btn(S.BTN_TO_TEXT, "menu:add"), btn(S.BTN_TO_ADVANCED, "menu:advanced")],
+        [btn(S.BTN_BACK, "back")],
+    ])
 
 
 def advanced_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [button("Таблица", "build:table"), button("Формула LaTeX", "build:math")],
-            [button("Карта", "build:map"), button("Сноска", "build:footnote")],
-            [button("Ссылка / упоминание", "build:link"), button("Якорь", "build:anchor")],
-            [button("Кастомный эмодзи", "build:emoji"), button("Дата / время", "build:time")],
-            [button("Готовый Markdown/HTML", "build:raw")],
-            [button("Назад к блокам", "menu:add"), button("Главное меню", "back")],
-        ]
-    )
+    return kb([
+        [btn(S.BTN_TABLE, "build:table"), btn(S.BTN_MATH, "build:math")],
+        [btn(S.BTN_MAP, "build:map"), btn(S.BTN_FOOTNOTE, "build:footnote")],
+        [btn(S.BTN_LINK, "build:link"), btn(S.BTN_ANCHOR, "build:anchor")],
+        [btn(S.BTN_EMOJI, "build:emoji"), btn(S.BTN_TIME, "build:time")],
+        [btn(S.BTN_RAW, "build:raw")],
+        [btn(S.BTN_TO_TEXT, "menu:add"), btn(S.BTN_TO_MEDIA, "menu:media")],
+        [btn(S.BTN_BACK, "back")],
+    ])
 
 
 def send_menu(data: dict[str, Any]) -> InlineKeyboardMarkup:
-    silent = "ДА" if data.get("silent", False) else "НЕТ"
-    protected = "ДА" if data.get("protected", False) else "НЕТ"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [button(f"Тихая отправка: {silent}", "send:toggle_silent")],
-            [button(f"Защита контента: {protected}", "send:toggle_protected")],
-            [button("Выбрать чат и отправить", "send:destination")],
-            [button("Назад", "back")],
-        ]
-    )
+    return kb([
+        [btn(S.BTN_SILENT.format(state="✅" if data.get("silent") else "⬜"), "send:toggle_silent")],
+        [btn(S.BTN_PROTECTED.format(state="✅" if data.get("protected") else "⬜"), "send:toggle_protected")],
+        [btn(S.BTN_DESTINATION, "send:destination")],
+        [btn(S.BTN_BACK, "back")],
+    ])
 
 
-PROMPTS = {
-    "heading": "Пришлите: УРОВЕНЬ|ТЕКСТ\nПример: 2|Новости проекта",
-    "paragraph": (
-        "Пришлите абзац в Rich Markdown. Можно использовать:\n"
-        "**жирный**, *курсив*, <u>подчеркнутый</u>, ~~зачеркнутый~~,\n"
-        "||спойлер||, `код`, ==выделенный==, <sup>верх</sup>, <sub>низ</sub>,\n"
-        "[ссылка](https://t.me/), $x^2 + y^2$."
-    ),
-    "footer": "Пришлите текст подвала.",
-    "list_ul": "Пришлите пункты маркированного списка: каждый пункт с новой строки.",
-    "list_ol": "Пришлите пункты нумерованного списка: каждый пункт с новой строки.",
-    "list_check": (
-        "Пришлите задачи с новой строки. Начните готовую задачу с +, остальные с -.\n"
-        "Пример:\n+ Готово\n- Еще не готово"
-    ),
-    "blockquote": "Первая строка: текст цитаты.\nВторая строка (необязательно): автор.",
-    "pullquote": "Первая строка: текст pull-цитаты.\nВторая строка (необязательно): автор.",
-    "code": "Первая строка: язык (например python).\nОстальные строки: сам код.",
-    "details": (
-        "Первая строка: OPEN или CLOSED.\nВторая строка: заголовок.\n"
-        "Остальные строки: содержимое Rich Markdown."
-    ),
-    "photo": "Пришлите: HTTPS_URL|подпись|спойлер да/нет",
-    "video": "Пришлите: HTTPS_URL|подпись|спойлер да/нет",
-    "audio": "Пришлите: HTTPS_URL|подпись\nСсылка должна вести прямо на аудиофайл (например .mp3).",
-    "animation": "Пришлите: HTTPS_URL|подпись|спойлер да/нет\nСсылка должна вести прямо на GIF.",
-    "voice": "Пришлите: HTTPS_URL|подпись\nДля голосовой заметки обычно нужен прямой URL на .ogg.",
-    "collage": (
-        "Пришлите прямые HTTPS-ссылки на фото/видео: каждая с новой строки.\n"
-        "Последней строкой можно добавить CAPTION:Подпись"
-    ),
-    "slideshow": (
-        "Пришлите прямые HTTPS-ссылки на фото/видео: каждая с новой строки.\n"
-        "Последней строкой можно добавить CAPTION:Подпись"
-    ),
-    "table": (
-        "Пришлите таблицу: каждая строка с новой строки, ячейки через |.\n"
-        "Первая строка станет заголовками.\nПример:\nНазвание|Цена\nЧай|100\nКофе|150"
-    ),
-    "math": "Пришлите формулу LaTeX без знаков $$.\nПример: E = mc^2",
-    "map": "Пришлите: ШИРОТА|ДОЛГОТА|МАСШТАБ\nПример: 41.9|12.5|14 (масштаб 13-20)",
-    "footnote": "Пришлите: ID|текст ссылки|определение\nПример: note1|источник|Официальная документация Telegram",
-    "link": (
-        "Пришлите: ТИП|ТЕКСТ|ЗНАЧЕНИЕ\nТипы: url, email, phone, mention, anchor.\n"
-        "Пример: mention|Иван|123456789"
-    ),
-    "anchor": "Пришлите имя якоря латиницей. Пример: chapter-1",
-    "emoji": "Пришлите: EMOJI_ID|обычный эмодзи\nПример: 5368324170671202286|👍",
-    "time": "Пришлите: UNIX_TIME|ФОРМАТ|ТЕКСТ\nПример: 1647531900|wDT|22:45 завтра",
-    "raw": (
-        "Пришлите готовый Rich Markdown или HTML. Он будет добавлен без изменений.\n"
-        "Этот пункт нужен для rowspan/colspan, сложных вложений и других точных настроек API."
-    ),
-}
-
-
+# ─────────────── Хелперы блоков ───────────────
 def get_blocks(data: dict[str, Any]) -> list[str]:
-    """Безопасно получить список блоков из данных FSM."""
     return list(data.get("blocks", []))
 
 
-async def append_block(state: FSMContext, block: str) -> None:
-    """Добавить один готовый блок Rich Markdown к текущему посту."""
+async def append_block(state: FSMContext, block_md: str) -> int:
     data = await state.get_data()
     blocks = get_blocks(data)
-    blocks.append(block.strip())
+    blocks.append(block_md.strip())
     await state.update_data(blocks=blocks)
+    return len(blocks)
 
 
-def public_url(value: str) -> str:
-    """Проверить, что медиа доступно Telegram по публичному URL."""
+def require_public_url(value: str) -> str:
     url = value.strip()
     if not url.startswith(("http://", "https://")):
         raise ValueError("Ссылка должна начинаться с http:// или https://")
@@ -213,9 +351,9 @@ def public_url(value: str) -> str:
 
 
 def split_pipe(text: str, minimum: int) -> list[str]:
-    parts = [part.strip() for part in text.split("|")]
+    parts = [p.strip() for p in text.split("|")]
     if len(parts) < minimum:
-        raise ValueError("Недостаточно частей, разделенных символом |")
+        raise ValueError("Недостаточно частей, разделённых |")
     return parts
 
 
@@ -224,499 +362,540 @@ def yes(value: str) -> bool:
 
 
 def media_html(kind: str, text: str) -> str:
-    """Построить отдельный HTML-медиаблок с подписью."""
-    parts = [part.strip() for part in text.split("|", 2)]
-    url = public_url(parts[0])
+    parts = [p.strip() for p in text.split("|", 2)]
+    url = require_public_url(parts[0])
     caption = parts[1] if len(parts) > 1 else ""
     spoiler = yes(parts[2]) if len(parts) > 2 else False
-
-    safe_url = html.escape(url, quote=True)
-    safe_caption = html.escape(caption)
-    spoiler_attr = " tg-spoiler" if spoiler and kind in {"photo", "video", "animation"} else ""
-
+    safe_url = html_mod.escape(url, quote=True)
+    safe_caption = html_mod.escape(caption)
+    spoiler_attr = ' tg-spoiler' if spoiler and kind in {"photo", "video", "animation"} else ""
     if kind == "photo":
-        media = f'<img src="{safe_url}"{spoiler_attr}/>'
+        tag = f'<img src="{safe_url}"{spoiler_attr}/>'
     elif kind in {"audio", "voice"}:
-        media = f'<audio src="{safe_url}"></audio>'
+        tag = f'<audio src="{safe_url}"></audio>'
     else:
-        media = f'<video src="{safe_url}"{spoiler_attr}></video>'
-
+        tag = f'<video src="{safe_url}"{spoiler_attr}></video>'
     if not caption:
-        return media
-    return f"<figure>{media}<figcaption>{safe_caption}</figcaption></figure>"
+        return tag
+    return f"<figure>{tag}<figcaption>{safe_caption}</figcaption></figure>"
 
 
-def gallery_html(kind: str, text: str) -> str:
-    """Построить tg-collage или tg-slideshow из списка URL."""
-    raw_lines = [line.strip() for line in text.splitlines() if line.strip()]
-    if not raw_lines:
-        raise ValueError("Нужна хотя бы одна ссылка")
-
+def gallery_html(kind: str, entries: list[tuple[str, str | None]]) -> str:
+    if not 1 <= len(entries) <= 50:
+        raise ValueError("Допустимо от 1 до 50 медиа")
+    tags = []
     caption = ""
-    if raw_lines[-1].lower().startswith("caption:"):
-        caption = raw_lines.pop().split(":", 1)[1].strip()
-
-    if not 1 <= len(raw_lines) <= 50:
-        raise ValueError("Допустимо от 1 до 50 медиафайлов")
-
-    media_tags = []
-    image_extensions = (".jpg", ".jpeg", ".png", ".webp")
-    for raw_url in raw_lines:
-        url = public_url(raw_url)
-        clean_path = url.lower().split("?", 1)[0]
-        safe_url = html.escape(url, quote=True)
-        if clean_path.endswith(image_extensions):
-            media_tags.append(f'<img src="{safe_url}"/>')
-        else:
-            media_tags.append(f'<video src="{safe_url}"></video>')
-
+    img_ext = (".jpg", ".jpeg", ".png", ".webp")
+    for url, _ in entries:
+        path = url.lower().split("?", 1)[0]
+        safe = html_mod.escape(url, quote=True)
+        tags.append(f'<img src="{safe}"/>' if path.endswith(img_ext) else f'<video src="{safe}"></video>')
+    # последний caption берём из записей с пометкой caption
+    for _, cap in entries:
+        if cap:
+            caption = cap
     tag = "tg-collage" if kind == "collage" else "tg-slideshow"
-    caption_html = f"<figcaption>{html.escape(caption)}</figcaption>" if caption else ""
-    return f"<{tag}>{''.join(media_tags)}{caption_html}</{tag}>"
+    cap_html = f"<figcaption>{html_mod.escape(caption)}</figcaption>" if caption else ""
+    return f"<{tag}>{''.join(tags)}{cap_html}</{tag}>"
 
 
 def build_block(kind: str, text: str) -> str:
-    """Преобразовать ответ пользователя в официальный Rich Markdown/HTML."""
     text = text.strip()
     if not text:
         raise ValueError("Пустой блок добавить нельзя")
 
     if kind == "heading":
-        level_text, title = split_pipe(text, 2)[:2]
-        level = int(level_text)
-        if level not in range(1, 7):
-            raise ValueError("Уровень заголовка должен быть от 1 до 6")
-        return f"{'#' * level} {title}"
-
+        lvl, title = split_pipe(text, 2)[:2]
+        n = int(lvl)
+        if not 1 <= n <= 6:
+            raise ValueError("Уровень заголовка 1..6")
+        return f"{'#' * n} {title}"
     if kind in {"paragraph", "raw"}:
         return text
-
     if kind == "footer":
-        return f"<footer>{html.escape(text)}</footer>"
-
+        return f"<footer>{html_mod.escape(text)}</footer>"
     if kind in {"list_ul", "list_ol", "list_check"}:
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         if kind == "list_ul":
-            return "\n".join(f"- {line}" for line in lines)
+            return "\n".join(f"- {ln}" for ln in lines)
         if kind == "list_ol":
-            return "\n".join(f"{index}. {line}" for index, line in enumerate(lines, 1))
-        result = []
-        for line in lines:
-            checked = line.startswith("+")
-            content = line[1:].strip() if line[:1] in {"+", "-"} else line
-            result.append(f"- [{'x' if checked else ' '}] {content}")
-        return "\n".join(result)
-
+            return "\n".join(f"{i}. {ln}" for i, ln in enumerate(lines, 1))
+        out = []
+        for ln in lines:
+            done = ln.startswith("+")
+            body = ln[1:].strip() if ln[:1] in "+-" else ln
+            out.append(f"- [{'x' if done else ' '}] {body}")
+        return "\n".join(out)
     if kind == "blockquote":
         lines = text.splitlines()
         quote = lines[0]
         author = lines[1].strip() if len(lines) > 1 else ""
-        result = "\n".join(f"> {line}" for line in quote.splitlines())
+        out = "\n".join(f"> {ln}" for ln in quote.splitlines())
         if author:
-            result += f"\n>\n> {author}"
-        return result
-
+            out += f"\n>\n> {author}"
+        return out
     if kind == "pullquote":
         lines = text.splitlines()
-        quote = html.escape(lines[0])
-        author = html.escape(lines[1].strip()) if len(lines) > 1 else ""
-        return f"<aside>{quote}{f'<cite>{author}</cite>' if author else ''}</aside>"
-
+        body = html_mod.escape(lines[0])
+        author = html_mod.escape(lines[1].strip()) if len(lines) > 1 else ""
+        return f"<aside>{body}{f'<cite>{author}</cite>' if author else ''}</aside>"
     if kind == "code":
         lines = text.splitlines()
         if len(lines) < 2:
-            raise ValueError("Укажите язык первой строкой, а код - со второй")
-        language = re.sub(r"[^a-zA-Z0-9_+.-]", "", lines[0])
-        code_text = "\n".join(lines[1:])
-        return f"```{language}\n{code_text}\n```"
-
+            raise ValueError("Первая строка - язык, далее код")
+        lang = re.sub(r"[^a-zA-Z0-9_+.-]", "", lines[0])
+        body = "\n".join(lines[1:])
+        return f"```{lang}\n{body}\n```"
     if kind == "details":
         lines = text.splitlines()
         if len(lines) < 3:
-            raise ValueError("Нужны режим, заголовок и содержимое на отдельных строках")
+            raise ValueError("Нужны: OPEN/CLOSED, заголовок, содержимое")
         open_attr = " open" if lines[0].strip().upper() == "OPEN" else ""
         summary = lines[1].strip()
         body = "\n".join(lines[2:])
         return f"<details{open_attr}><summary>{summary}</summary>\n\n{body}\n\n</details>"
-
     if kind in {"photo", "video", "audio", "animation", "voice"}:
         return media_html(kind, text)
-
-    if kind in {"collage", "slideshow"}:
-        return gallery_html(kind, text)
-
     if kind == "table":
-        rows = [[cell.strip() for cell in line.split("|")] for line in text.splitlines() if line.strip()]
+        rows = [[c.strip() for c in ln.split("|")] for ln in text.splitlines() if ln.strip()]
         if len(rows) < 2:
-            raise ValueError("Нужно минимум две строки: заголовки и одна строка данных")
-        columns = len(rows[0])
-        if not 1 <= columns <= 20 or any(len(row) != columns for row in rows):
-            raise ValueError("Во всех строках должно быть одинаковое число ячеек (максимум 20)")
-        header = "| " + " | ".join(rows[0]) + " |"
-        alignment = "| " + " | ".join(":---" for _ in range(columns)) + " |"
-        body = ["| " + " | ".join(row) + " |" for row in rows[1:]]
-        return "\n".join([header, alignment, *body])
-
+            raise ValueError("Нужен хотя бы заголовок и одна строка")
+        cols = len(rows[0])
+        if not 1 <= cols <= 20 or any(len(r) != cols for r in rows):
+            raise ValueError("Число ячеек должно быть одинаковым и ≤ 20")
+        head = "| " + " | ".join(rows[0]) + " |"
+        align = "| " + " | ".join(":---" for _ in range(cols)) + " |"
+        body = ["| " + " | ".join(r) + " |" for r in rows[1:]]
+        return "\n".join([head, align, *body])
     if kind == "math":
         return f"$$\n{text}\n$$"
-
     if kind == "map":
-        lat_text, long_text, zoom_text = split_pipe(text, 3)[:3]
-        lat, long = float(lat_text), float(long_text)
-        zoom = int(zoom_text)
-        if not (-90 <= lat <= 90 and -180 <= long <= 180 and 13 <= zoom <= 20):
-            raise ValueError("Проверьте координаты; масштаб должен быть от 13 до 20")
-        return f'<tg-map lat="{lat}" long="{long}" zoom="{zoom}"/>'
-
+        lat, lon, z = split_pipe(text, 3)[:3]
+        lat_f, lon_f, z_i = float(lat), float(lon), int(z)
+        if not (-90 <= lat_f <= 90 and -180 <= lon_f <= 180 and 13 <= z_i <= 20):
+            raise ValueError("Координаты или масштаб некорректны (zoom 13..20)")
+        return f'<tg-map lat="{lat_f}" long="{lon_f}" zoom="{z_i}"/>'
     if kind == "footnote":
-        note_id, label, definition = split_pipe(text, 3)[:3]
-        note_id = re.sub(r"[^a-zA-Z0-9_-]", "", note_id)
-        if not note_id:
-            raise ValueError("ID сноски должен содержать латинские буквы или цифры")
-        return f"{label}[^{note_id}]\n\n[^{note_id}]: {definition}"
-
+        fid, label, defn = split_pipe(text, 3)[:3]
+        fid = re.sub(r"[^a-zA-Z0-9_-]", "", fid)
+        if not fid:
+            raise ValueError("ID сноски должен содержать латиницу/цифры")
+        return f"{label}[^{fid}]\n\n[^{fid}]: {defn}"
     if kind == "link":
-        link_type, label, target = split_pipe(text, 3)[:3]
-        prefixes = {
-            "url": "",
-            "email": "mailto:",
-            "phone": "tel:",
-            "mention": "tg://user?id=",
-            "anchor": "#",
-        }
-        link_type = link_type.lower()
-        if link_type not in prefixes:
-            raise ValueError("Тип должен быть: url, email, phone, mention или anchor")
-        return f"[{label}]({prefixes[link_type]}{target})"
-
+        t, lbl, tgt = split_pipe(text, 3)[:3]
+        prefixes = {"url": "", "email": "mailto:", "phone": "tel:", "mention": "tg://user?id=", "anchor": "#"}
+        t = t.lower()
+        if t not in prefixes:
+            raise ValueError("Тип: url, email, phone, mention, anchor")
+        return f"[{lbl}]({prefixes[t]}{tgt})"
     if kind == "anchor":
         name = re.sub(r"[^a-zA-Z0-9_-]", "", text)
         if not name:
-            raise ValueError("Имя якоря должно содержать латинские буквы или цифры")
+            raise ValueError("Имя якоря должно содержать латиницу/цифры")
         return f'<a name="{name}"></a>'
-
     if kind == "emoji":
-        emoji_id, alternative = split_pipe(text, 2)[:2]
-        if not emoji_id.isdigit():
-            raise ValueError("ID кастомного эмодзи должен состоять из цифр")
-        return f"![{alternative}](tg://emoji?id={emoji_id})"
-
+        eid, alt = split_pipe(text, 2)[:2]
+        if not eid.isdigit():
+            raise ValueError("ID кастомного эмодзи должен быть числом")
+        return f"![{alt}](tg://emoji?id={eid})"
     if kind == "time":
-        unix_text, time_format, label = split_pipe(text, 3)[:3]
-        unix_time = int(unix_text)
-        return f"![{label}](tg://time?unix={unix_time}&format={time_format})"
-
-    raise ValueError(f"Неизвестный тип блока: {kind}")
+        u, fmt, lbl = split_pipe(text, 3)[:3]
+        return f"![{lbl}](tg://time?unix={int(u)}&format={fmt})"
+    raise ValueError(f"Неизвестный тип: {kind}")
 
 
 def assembled_markdown(data: dict[str, Any]) -> str:
     blocks = get_blocks(data)
-    markdown = "\n\n".join(blocks)
-    if not markdown:
-        raise ValueError("Пост пуст. Сначала добавьте хотя бы один блок.")
-    if len(markdown.encode("utf-8")) > 32768:
-        raise ValueError("Пост превышает лимит 32768 байт UTF-8")
-    return markdown
+    if not blocks:
+        raise ValueError(S.EMPTY_POST)
+    md = "\n\n".join(blocks)
+    if len(md.encode("utf-8")) > 32768:
+        raise ValueError(S.POST_TOO_BIG)
+    return md
 
 
 async def show_main(target: types.Message, state: FSMContext) -> None:
     data = await state.get_data()
     count = len(get_blocks(data))
-    await target.answer(f"Конструктор Rich-постов. Блоков в посте: {count}", reply_markup=main_menu())
+    await target.answer(
+        S.MAIN_TITLE.format(count=count),
+        reply_markup=main_menu(data),
+    )
 
 
+# ─────────────── Команды ───────────────
 @dp.message(Command("start"))
-async def command_start(message: types.Message, state: FSMContext) -> None:
+async def cmd_start(message: types.Message, state: FSMContext) -> None:
+    await message.answer(S.WELCOME)
     await show_main(message, state)
 
 
 @dp.message(Command("help"))
-async def command_help(message: types.Message) -> None:
-    await message.answer(
-        "Собирайте пост через кнопку 'Добавить блок'.\n\n"
-        "Медиа: нужна публичная прямая HTTP/HTTPS-ссылка на файл. Просто загруженный в чат "
-        "файл нельзя вставить в Rich Markdown без внешнего URL.\n\n"
-        "Команды:\n/start - главное меню\n/cancel - отменить ввод\n"
-        "/edit CHAT_ID MESSAGE_ID - заменить отправленный пост текущим черновиком"
-    )
+async def cmd_help(message: types.Message) -> None:
+    await message.answer(S.HELP_TEXT)
 
 
 @dp.message(Command("cancel"))
-async def command_cancel(message: types.Message, state: FSMContext) -> None:
+async def cmd_cancel(message: types.Message, state: FSMContext) -> None:
     await state.set_state(None)
-    await message.answer("Текущий ввод отменен. Собранные блоки сохранены в памяти.", reply_markup=main_menu())
+    await message.answer(S.CANCELLED, reply_markup=main_menu(await state.get_data()))
+
+
+@dp.message(Command("done"))
+async def cmd_done(message: types.Message, state: FSMContext) -> None:
+    """Завершить сбор коллажа/слайдшоу."""
+    data = await state.get_data()
+    if data.get("pending") not in {"collage", "slideshow"}:
+        return
+    entries = data.get("gallery_entries", [])
+    kind = data["pending"]
+    try:
+        block = gallery_html(kind, entries)
+        n = await append_block(state, block)
+    except ValueError as e:
+        await message.answer(f"⚠️ {e}")
+        return
+    await state.update_data(pending=None, gallery_entries=None)
+    await state.set_state(None)
+    await message.answer(S.BLOCK_ADDED.format(count=n), reply_markup=main_menu(await state.get_data()))
 
 
 @dp.message(Command("edit"))
-async def command_edit(message: types.Message, state: FSMContext) -> None:
+async def cmd_edit(message: types.Message, state: FSMContext) -> None:
     parts = (message.text or "").split()
     if len(parts) != 3:
-        await message.answer("Формат: /edit CHAT_ID MESSAGE_ID")
+        await message.answer(S.EDIT_PROMPT_FORMAT)
         return
-    raw_chat_id, raw_message_id = parts[1], parts[2]
-    chat_id: int | str = int(raw_chat_id) if raw_chat_id.lstrip("-").isdigit() else raw_chat_id
+    raw_chat, raw_mid = parts[1], parts[2]
+    chat_id: int | str = int(raw_chat) if raw_chat.lstrip("-").isdigit() else raw_chat
     try:
-        message_id = int(raw_message_id)
-        markdown = assembled_markdown(await state.get_data())
-        await edit_rich_message(chat_id, message_id, markdown=markdown)
-    except (ValueError, TelegramAPIError) as error:
-        await message.answer(f"Не удалось отредактировать пост:\n{error}")
+        mid = int(raw_mid)
+        md = assembled_markdown(await state.get_data())
+        await edit_rich_message(chat_id, mid, markdown=md)
+    except (ValueError, TelegramAPIError) as e:
+        await message.answer(S.EDIT_ERROR.format(error=e))
         return
-    await message.answer("Пост отредактирован.", reply_markup=main_menu())
+    await message.answer(S.EDIT_OK, reply_markup=main_menu(await state.get_data()))
 
 
+# ─────────────── Callback-обработчики ───────────────
 @dp.callback_query(F.data == "back")
-async def callback_back(callback: types.CallbackQuery, state: FSMContext) -> None:
+async def cb_back(cb: types.CallbackQuery, state: FSMContext) -> None:
     await state.set_state(None)
     data = await state.get_data()
-    count = len(get_blocks(data))
-    await callback.message.edit_text(f"Конструктор Rich-постов. Блоков: {count}", reply_markup=main_menu())
-    await callback.answer()
+    await cb.message.edit_text(S.MAIN_TITLE.format(count=len(get_blocks(data))), reply_markup=main_menu(data))
+    await cb.answer()
 
 
 @dp.callback_query(F.data == "menu:add")
-async def callback_add_menu(callback: types.CallbackQuery) -> None:
-    await callback.message.edit_text("Выберите тип блока:", reply_markup=add_text_menu())
-    await callback.answer()
+async def cb_text(cb: types.CallbackQuery) -> None:
+    await cb.message.edit_text(S.MENU_TEXT_TITLE, reply_markup=text_menu())
+    await cb.answer()
 
 
 @dp.callback_query(F.data == "menu:media")
-async def callback_media_menu(callback: types.CallbackQuery) -> None:
-    await callback.message.edit_text(
-        "Выберите медиа. Нужна публичная прямая HTTP/HTTPS-ссылка на файл:",
-        reply_markup=media_menu(),
-    )
-    await callback.answer()
+async def cb_media(cb: types.CallbackQuery) -> None:
+    await cb.message.edit_text(S.MENU_MEDIA_TITLE, reply_markup=media_menu())
+    await cb.answer()
 
 
 @dp.callback_query(F.data == "menu:advanced")
-async def callback_advanced_menu(callback: types.CallbackQuery) -> None:
-    await callback.message.edit_text("Дополнительные Rich-блоки:", reply_markup=advanced_menu())
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("build:"))
-async def callback_start_block(callback: types.CallbackQuery, state: FSMContext) -> None:
-    kind = callback.data.split(":", 1)[1]
-    prompt = PROMPTS.get(kind)
-    if not prompt:
-        await callback.answer("Неизвестный тип блока", show_alert=True)
-        return
-    await state.update_data(pending=kind)
-    await state.set_state(Builder.waiting_block)
-    await callback.message.answer(prompt + "\n\nДля отмены: /cancel")
-    await callback.answer()
+async def cb_adv(cb: types.CallbackQuery) -> None:
+    await cb.message.edit_text(S.MENU_ADVANCED_TITLE, reply_markup=advanced_menu())
+    await cb.answer()
 
 
 @dp.callback_query(F.data == "instant:divider")
-async def callback_divider(callback: types.CallbackQuery, state: FSMContext) -> None:
-    await append_block(state, "---")
-    await callback.answer("Разделитель добавлен")
-    await callback.message.answer("Разделитель добавлен.", reply_markup=main_menu())
+async def cb_divider(cb: types.CallbackQuery, state: FSMContext) -> None:
+    n = await append_block(state, "---")
+    await cb.answer()
+    await cb.message.answer(S.BLOCK_ADDED_INSTANT.format(kind="разделитель"), reply_markup=main_menu(await state.get_data()))
 
 
+@dp.callback_query(F.data.startswith("build:"))
+async def cb_start_build(cb: types.CallbackQuery, state: FSMContext) -> None:
+    kind = cb.data.split(":", 1)[1]
+    await state.update_data(pending=kind, gallery_entries=[] if kind in {"collage", "slideshow"} else None)
+    if kind in {"collage", "slideshow"}:
+        await state.set_state(Builder.waiting_gallery)
+        await cb.message.answer(S.PROMPTS[kind] + S.WAITING_CANCEL_HINT)
+    else:
+        await state.set_state(Builder.waiting_block)
+        await cb.message.answer(S.PROMPTS[kind] + S.WAITING_CANCEL_HINT)
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "preview")
+async def cb_preview(cb: types.CallbackQuery, state: FSMContext) -> None:
+    try:
+        md = assembled_markdown(await state.get_data())
+        await send_rich_message(cb.from_user.id, markdown=md)
+    except (ValueError, TelegramAPIError) as e:
+        await cb.answer("Превью не отправлено", show_alert=True)
+        await cb.message.answer(f"⚠️ {e}")
+        return
+    await cb.answer("Превью отправлено в чат")
+
+
+@dp.callback_query(F.data == "menu:send")
+async def cb_send(cb: types.CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    await cb.message.edit_text(S.SEND_TITLE, reply_markup=send_menu(data))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.in_({"send:toggle_silent", "send:toggle_protected"}))
+async def cb_toggle(cb: types.CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    key = "silent" if cb.data.endswith("silent") else "protected"
+    await state.update_data(**{key: not data.get(key, False)})
+    await cb.message.edit_reply_markup(reply_markup=send_menu(await state.get_data()))
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "send:destination")
+async def cb_dest(cb: types.CallbackQuery, state: FSMContext) -> None:
+    try:
+        assembled_markdown(await state.get_data())
+    except ValueError as e:
+        await cb.answer(str(e), show_alert=True)
+        return
+    await state.set_state(Builder.waiting_destination)
+    await cb.message.answer(S.SEND_PROMPT + S.WAITING_CANCEL_HINT)
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "draft:save")
+async def cb_dsave(cb: types.CallbackQuery, state: FSMContext) -> None:
+    try:
+        md = assembled_markdown(await state.get_data())
+        await save_draft(cb.from_user.id, md, "")
+    except ValueError as e:
+        await cb.answer(str(e), show_alert=True)
+        return
+    await cb.answer(S.DRAFT_SAVED, show_alert=True)
+
+
+@dp.callback_query(F.data == "draft:load")
+async def cb_dload(cb: types.CallbackQuery, state: FSMContext) -> None:
+    row = await load_draft(cb.from_user.id)
+    if not row or not row[0]:
+        await cb.answer(S.DRAFT_NOT_FOUND, show_alert=True)
+        return
+    # При загрузке восстанавливаем черновик как единый "raw"-блок, чтобы можно было редактировать.
+    await state.update_data(blocks=[row[0]])
+    await cb.answer(S.DRAFT_LOADED, show_alert=True)
+    await cb.message.answer(S.DRAFT_LOADED, reply_markup=main_menu(await state.get_data()))
+
+
+@dp.callback_query(F.data == "menu:templates")
+async def cb_templates(cb: types.CallbackQuery, state: FSMContext) -> None:
+    names = await list_templates()
+    await state.update_data(template_names=names)
+    rows = [[btn(S.BTN_SAVE_AS_TEMPLATE, "template:save")]]
+    for i, n in enumerate(names):
+        rows.append([btn(f"{S.TEMPLATE_LOAD_PREFIX}{n[:35]}", f"template:load:{i}")])
+    rows.append([btn(S.BTN_BACK, "back")])
+    await cb.message.edit_text(S.TEMPLATES_EMPTY if not names else "📂 <b>Шаблоны:</b>", reply_markup=kb(rows))
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "template:save")
+async def cb_tpl_save(cb: types.CallbackQuery, state: FSMContext) -> None:
+    try:
+        assembled_markdown(await state.get_data())
+    except ValueError as e:
+        await cb.answer(str(e), show_alert=True)
+        return
+    await state.set_state(Builder.waiting_template_name)
+    await cb.message.answer(S.TEMPLATE_NAME_PROMPT + S.WAITING_CANCEL_HINT)
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("template:load:"))
+async def cb_tpl_load(cb: types.CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    names = data.get("template_names", [])
+    try:
+        name = names[int(cb.data.rsplit(":", 1)[1])]
+    except (IndexError, ValueError):
+        await cb.answer("Список устарел, откройте заново", show_alert=True)
+        return
+    row = await load_template(name)
+    if not row:
+        await cb.answer(S.TEMPLATE_NOT_FOUND, show_alert=True)
+        return
+    await state.update_data(blocks=[row[0]])
+    await cb.answer(S.TEMPLATE_LOADED.format(name=name), show_alert=True)
+    await cb.message.answer(S.TEMPLATE_LOADED.format(name=name), reply_markup=main_menu(await state.get_data()))
+
+
+@dp.callback_query(F.data == "undo")
+async def cb_undo(cb: types.CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    blocks = get_blocks(data)
+    if not blocks:
+        await cb.answer(S.UNDO_EMPTY, show_alert=True)
+        return
+    blocks.pop()
+    await state.update_data(blocks=blocks)
+    await cb.message.answer(S.UNDO_OK.format(count=len(blocks)), reply_markup=main_menu(await state.get_data()))
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "reset")
+async def cb_reset(cb: types.CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await cb.message.edit_text(S.RESET_OK, reply_markup=main_menu({}))
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "help")
+async def cb_help(cb: types.CallbackQuery) -> None:
+    await cb.message.answer(S.HELP_TEXT)
+    await cb.answer()
+
+
+# ─────────────── Приём текстовых данных для блоков ───────────────
 @dp.message(Builder.waiting_block, F.text)
-async def receive_block(message: types.Message, state: FSMContext) -> None:
+async def got_text_block(message: types.Message, state: FSMContext) -> None:
     data = await state.get_data()
     kind = data.get("pending", "")
     try:
         block = build_block(kind, message.text)
-        await append_block(state, block)
-    except (ValueError, TypeError) as error:
-        await message.answer(f"Ошибка: {error}\n\nПопробуйте еще раз или отправьте /cancel.")
+        n = await append_block(state, block)
+    except (ValueError, TypeError) as e:
+        await message.answer(S.BLOCK_ERROR.format(error=e))
         return
-
     await state.set_state(None)
-    count = len(get_blocks(await state.get_data()))
-    await message.answer(f"Блок добавлен. Всего блоков: {count}", reply_markup=main_menu())
+    await state.update_data(pending=None)
+    await message.answer(S.BLOCK_ADDED.format(count=n), reply_markup=main_menu(await state.get_data()))
 
 
+# ─────────────── Приём ФАЙЛОВ как блоков ───────────────
 @dp.message(Builder.waiting_block)
-async def receive_non_text_block(message: types.Message) -> None:
-    await message.answer(
-        "Для этого конструктора пришлите текст или прямую HTTP/HTTPS-ссылку. "
-        "Загруженный файл не имеет публичного URL. Для отмены: /cancel"
-    )
-
-
-@dp.callback_query(F.data == "preview")
-async def callback_preview(callback: types.CallbackQuery, state: FSMContext) -> None:
-    try:
-        markdown = assembled_markdown(await state.get_data())
-        await send_rich_message(callback.from_user.id, markdown=markdown)
-    except (ValueError, TelegramAPIError) as error:
-        await callback.answer("Предпросмотр не отправлен", show_alert=True)
-        await callback.message.answer(f"Ошибка Telegram:\n{error}")
-        return
-    await callback.answer("Предпросмотр отправлен вам в личный чат")
-
-
-@dp.callback_query(F.data == "menu:send")
-async def callback_send_menu(callback: types.CallbackQuery, state: FSMContext) -> None:
+async def got_file_block(message: types.Message, state: FSMContext) -> None:
     data = await state.get_data()
-    await callback.message.edit_text("Настройки отправки:", reply_markup=send_menu(data))
-    await callback.answer()
-
-
-@dp.callback_query(F.data.in_({"send:toggle_silent", "send:toggle_protected"}))
-async def callback_toggle_send(callback: types.CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    key = "silent" if callback.data.endswith("silent") else "protected"
-    await state.update_data(**{key: not data.get(key, False)})
-    await callback.message.edit_reply_markup(reply_markup=send_menu(await state.get_data()))
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "send:destination")
-async def callback_destination(callback: types.CallbackQuery, state: FSMContext) -> None:
-    try:
-        assembled_markdown(await state.get_data())
-    except ValueError as error:
-        await callback.answer(str(error), show_alert=True)
+    kind = data.get("pending", "")
+    if kind not in {"photo", "video", "audio", "animation", "voice"}:
+        await message.answer(S.NON_TEXT_BLOCK_ERROR)
         return
-    await state.set_state(Builder.waiting_destination)
-    await callback.message.answer(
-        "Пришлите @username канала/группы или числовой chat_id.\n"
-        "Для личной отправки можно прислать user_id. Для отмены: /cancel"
-    )
-    await callback.answer()
+
+    status = await message.answer(S.MEDIA_RECEIVED)
+    try:
+        url, name, _mime = await upload_user_media(bot, message)
+    except Exception as e:
+        await status.edit_text(S.MEDIA_ERROR.format(error=e))
+        return
+
+    caption = message.caption or ""
+    parts = [url, caption]
+    # Пользователь может передать "да/нет" спойлера подписью к файлу через |
+    if "|" in caption:
+        cap, sp = caption.rsplit("|", 1)
+        parts = [url, cap.strip(), sp.strip()]
+    else:
+        parts = [url, caption]
+    block = build_block(kind, "|".join(parts))
+    n = await append_block(state, block)
+    await state.set_state(None)
+    await state.update_data(pending=None)
+    await message.answer(S.MEDIA_UPLOADED.format(url=url))
+    await message.answer(S.BLOCK_ADDED.format(count=n), reply_markup=main_menu(await state.get_data()))
 
 
+# ─────────────── Сбор галереи (коллаж/слайдшоу) по файлам ──────
+@dp.message(Builder.waiting_gallery, F.text)
+async def got_gallery_text(message: types.Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    kind = data.get("pending", "")
+    text = (message.text or "").strip()
+    entries: list[tuple[str, str | None]] = list(data.get("gallery_entries", []))
+
+    # Поддержка "CAPTION: ..."
+    if text.lower().startswith("caption:"):
+        cap = text.split(":", 1)[1].strip()
+        if entries and entries[-1][1] is None:
+            entries[-1] = (entries[-1][0], cap)
+        else:
+            # caption без файла - добавим как глобальную подпись через пустой url
+            entries.append(("", cap))
+    else:
+        # строки-ссылки
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for ln in lines:
+            if ln.lower().startswith("caption:"):
+                cap = ln.split(":", 1)[1].strip()
+                if entries:
+                    entries[-1] = (entries[-1][0], cap)
+                else:
+                    entries.append(("", cap))
+            else:
+                require_public_url(ln)
+                entries.append((ln, None))
+
+    await state.update_data(gallery_entries=entries)
+    await message.answer(f"✅ Добавлено ссылок: {len([e for e in entries if e[0]])}. Отправьте ещё файлы/ссылки или /done.")
+
+
+@dp.message(Builder.waiting_gallery)
+async def got_gallery_file(message: types.Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    kind = data.get("pending", "")
+    entries: list[tuple[str, str | None]] = list(data.get("gallery_entries", []))
+    status = await message.answer(S.MEDIA_RECEIVED)
+    try:
+        url, _name, _m = await upload_user_media(bot, message)
+    except Exception as e:
+        await status.edit_text(S.MEDIA_ERROR.format(error=e))
+        return
+    cap = message.caption
+    entries.append((url, cap))
+    await state.update_data(gallery_entries=entries)
+    await message.answer(S.MEDIA_UPLOADED.format(url=url) + "\nОтправьте ещё или /done.")
+
+
+# ─────────────── Отправка ───────────────
 @dp.message(Builder.waiting_destination, F.text)
-async def receive_destination(message: types.Message, state: FSMContext) -> None:
-    raw_chat_id = message.text.strip()
-    chat_id: int | str = int(raw_chat_id) if raw_chat_id.lstrip("-").isdigit() else raw_chat_id
+async def got_destination(message: types.Message, state: FSMContext) -> None:
+    raw = message.text.strip()
+    chat_id: int | str = int(raw) if raw.lstrip("-").isdigit() else raw
     data = await state.get_data()
     try:
-        markdown = assembled_markdown(data)
+        md = assembled_markdown(data)
         sent = await send_rich_message(
             chat_id,
-            markdown=markdown,
+            markdown=md,
             disable_notification=data.get("silent", False),
             protect_content=data.get("protected", False),
         )
         await log_sent(chat_id, sent["message_id"], "Rich post")
-    except (ValueError, TelegramAPIError) as error:
-        await message.answer(f"Не удалось отправить пост:\n{error}\n\nПришлите другой chat_id или /cancel.")
+    except (ValueError, TelegramAPIError) as e:
+        await message.answer(S.SEND_ERROR.format(error=e))
         return
-
     await state.set_state(None)
     await message.answer(
-        f"Пост отправлен. chat_id={chat_id}, message_id={sent['message_id']}",
-        reply_markup=main_menu(),
+        S.SEND_OK.format(chat_id=chat_id, message_id=sent["message_id"]),
+        reply_markup=main_menu(await state.get_data()),
     )
-
-
-@dp.callback_query(F.data == "draft:save")
-async def callback_save_draft(callback: types.CallbackQuery, state: FSMContext) -> None:
-    try:
-        markdown = assembled_markdown(await state.get_data())
-        await save_draft(callback.from_user.id, markdown, "")
-    except ValueError as error:
-        await callback.answer(str(error), show_alert=True)
-        return
-    await callback.answer("Черновик сохранен в SQLite", show_alert=True)
-
-
-@dp.callback_query(F.data == "draft:load")
-async def callback_load_draft(callback: types.CallbackQuery, state: FSMContext) -> None:
-    row = await load_draft(callback.from_user.id)
-    if not row or not row[0]:
-        await callback.answer("Сохраненного черновика нет", show_alert=True)
-        return
-    await state.update_data(blocks=[row[0]])
-    await callback.answer("Черновик загружен", show_alert=True)
-    await callback.message.answer("Черновик загружен.", reply_markup=main_menu())
-
-
-@dp.callback_query(F.data == "menu:templates")
-async def callback_templates(callback: types.CallbackQuery, state: FSMContext) -> None:
-    names = await list_templates()
-    await state.update_data(template_names=names)
-    rows = [[button("Сохранить текущий как шаблон", "template:save")]]
-    rows.extend([[button(f"Загрузить: {name[:35]}", f"template:load:{index}")] for index, name in enumerate(names)])
-    rows.append([button("Назад", "back")])
-    await callback.message.edit_text(
-        "Шаблоны:" if names else "Шаблонов пока нет.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "template:save")
-async def callback_template_name(callback: types.CallbackQuery, state: FSMContext) -> None:
-    try:
-        assembled_markdown(await state.get_data())
-    except ValueError as error:
-        await callback.answer(str(error), show_alert=True)
-        return
-    await state.set_state(Builder.waiting_template_name)
-    await callback.message.answer("Пришлите название шаблона (до 50 символов). Для отмены: /cancel")
-    await callback.answer()
 
 
 @dp.message(Builder.waiting_template_name, F.text)
-async def receive_template_name(message: types.Message, state: FSMContext) -> None:
+async def got_tpl_name(message: types.Message, state: FSMContext) -> None:
     name = message.text.strip()[:50]
     if not name:
-        await message.answer("Название не может быть пустым.")
+        await message.answer("Пустое имя недопустимо")
         return
-    markdown = assembled_markdown(await state.get_data())
-    await save_template(name, markdown, "")
+    md = assembled_markdown(await state.get_data())
+    await save_template(name, md, "")
     await state.set_state(None)
-    await message.answer(f"Шаблон '{name}' сохранен.", reply_markup=main_menu())
+    await message.answer(S.TEMPLATE_SAVED.format(name=name), reply_markup=main_menu(await state.get_data()))
 
 
-@dp.callback_query(F.data.startswith("template:load:"))
-async def callback_load_template(callback: types.CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    names = data.get("template_names", [])
-    try:
-        name = names[int(callback.data.rsplit(":", 1)[1])]
-    except (IndexError, ValueError):
-        await callback.answer("Список шаблонов устарел. Откройте меню заново.", show_alert=True)
-        return
-    row = await load_template(name)
-    if not row:
-        await callback.answer("Шаблон не найден", show_alert=True)
-        return
-    await state.update_data(blocks=[row[0]])
-    await callback.answer("Шаблон загружен", show_alert=True)
-    await callback.message.answer(f"Шаблон '{name}' загружен.", reply_markup=main_menu())
-
-
-@dp.callback_query(F.data == "undo")
-async def callback_undo(callback: types.CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    blocks = get_blocks(data)
-    if not blocks:
-        await callback.answer("Пост уже пуст", show_alert=True)
-        return
-    blocks.pop()
-    await state.update_data(blocks=blocks)
-    await callback.answer("Последний блок удален")
-    await callback.message.answer(f"Осталось блоков: {len(blocks)}", reply_markup=main_menu())
-
-
-@dp.callback_query(F.data == "reset")
-async def callback_reset(callback: types.CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    await callback.answer("Конструктор очищен", show_alert=True)
-    await callback.message.edit_text("Конструктор очищен. Блоков: 0", reply_markup=main_menu())
-
-
-@dp.callback_query(F.data == "help")
-async def callback_help(callback: types.CallbackQuery) -> None:
-    await callback.message.answer(
-        "Выберите 'Добавить блок'. Меню разделено на текст, медиа и дополнительные блоки.\n"
-        "Медиа принимаются только по прямым HTTP/HTTPS-ссылкам, как требует Rich Message API."
-    )
-    await callback.answer()
-
-
+# ─────────────── Запуск ───────────────
 async def main() -> None:
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN не найден. Проверьте файл .env или Variables в Railway.")
+        raise RuntimeError("BOT_TOKEN не найден. Проверь .env или Variables в Railway.")
     await init_db()
     await bot.delete_webhook(drop_pending_updates=True)
     try:
